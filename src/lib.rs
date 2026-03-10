@@ -12,7 +12,7 @@
 //! use nuts_rs::{CpuLogpFunc, CpuMath, LogpError, DiagGradNutsSettings, Chain, Progress,
 //! Settings, HasDims};
 //! use thiserror::Error;
-//! use rand::thread_rng;
+//! use rand::rng;
 //! use std::collections::HashMap;
 //!
 //! // Define a function that computes the unnormalized posterior density
@@ -76,7 +76,7 @@
 //! let math = CpuMath::new(logp_func);
 //!
 //! let chain = 0;
-//! let mut rng = thread_rng();
+//! let mut rng = rng();
 //! let mut sampler = settings.new_chain(0, math, &mut rng);
 //!
 //! // Set to some initial position and start drawing samples.
@@ -117,7 +117,8 @@ mod transform_adapt_strategy;
 mod transformed_hamiltonian;
 
 pub use nuts_derive::Storable;
-pub use nuts_storable::{HasDims, ItemType, Storable, Value};
+pub use nuts_storable::{DateTimeUnit, HasDims, ItemType, Storable, Value};
+pub use rand;
 
 pub use adapt_strategy::EuclideanAdaptOptions;
 pub use chain::Chain;
@@ -145,3 +146,6 @@ pub use storage::{CsvConfig, CsvTraceStorage};
 pub use storage::{HashMapConfig, HashMapValue};
 #[cfg(feature = "ndarray")]
 pub use storage::{NdarrayConfig, NdarrayTrace, NdarrayValue};
+
+#[cfg(feature = "arrow")]
+pub use storage::{ArrowConfig, ArrowTrace, ArrowTraceStorage};

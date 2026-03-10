@@ -26,6 +26,7 @@ impl HashMapValue {
             ItemType::I64 => HashMapValue::I64(Vec::new()),
             ItemType::U64 => HashMapValue::U64(Vec::new()),
             ItemType::String => HashMapValue::String(Vec::new()),
+            ItemType::DateTime64(_) | ItemType::TimeDelta64(_) => HashMapValue::I64(Vec::new()),
         }
     }
 
@@ -45,18 +46,25 @@ impl HashMapValue {
             (HashMapValue::Bool(vec), Value::Bool(v)) => vec.extend(v),
             (HashMapValue::I64(vec), Value::I64(v)) => vec.extend(v),
 
+            (HashMapValue::String(vec), Value::Strings(v)) => vec.extend(v),
+            (HashMapValue::String(vec), Value::ScalarString(v)) => vec.push(v),
+            (HashMapValue::I64(vec), Value::DateTime64(_, v)) => vec.extend(v),
+            (HashMapValue::I64(vec), Value::TimeDelta64(_, v)) => vec.extend(v),
+
             _ => panic!("Mismatched item type"),
         }
     }
 }
 
 /// Main storage for HashMap MCMC traces
+#[derive(Clone)]
 pub struct HashMapTraceStorage {
     draw_types: Vec<(String, ItemType)>,
     param_types: Vec<(String, ItemType)>,
 }
 
 /// Per-chain storage for HashMap MCMC traces
+#[derive(Clone)]
 pub struct HashMapChainStorage {
     warmup_stats: HashMap<String, HashMapValue>,
     sample_stats: HashMap<String, HashMapValue>,
@@ -251,6 +259,10 @@ impl ChainStorage for HashMapChainStorage {
     fn flush(&self) -> Result<()> {
         Ok(())
     }
+
+    fn inspect(&self) -> Result<Option<Self::Finalized>> {
+        self.clone().finalize().map(Some)
+    }
 }
 
 pub struct HashMapConfig {}
@@ -313,5 +325,13 @@ impl TraceStorage for HashMapTraceStorage {
         }
 
         Ok((first_error, results))
+    }
+
+    fn inspect(
+        &self,
+        traces: Vec<Result<Option<<Self::ChainStorage as ChainStorage>::Finalized>>>,
+    ) -> Result<(Option<anyhow::Error>, Self::Finalized)> {
+        self.clone()
+            .finalize(traces.into_iter().map(|r| r.map(|o| o.unwrap())).collect())
     }
 }

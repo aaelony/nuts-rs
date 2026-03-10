@@ -5,9 +5,9 @@ use nuts_storable::{HasDims, Storable};
 use rand::Rng;
 use serde::Serialize;
 
-use super::mass_matrix::MassMatrixAdaptStrategy;
 use super::stepsize::AcceptanceRateCollector;
 use super::stepsize::{StepSizeSettings, Strategy as StepSizeStrategy};
+use crate::mass_matrix::MassMatrixAdaptStrategy;
 use crate::{
     NutsError,
     chain::AdaptStrategy,
@@ -210,6 +210,7 @@ pub struct GlobalStrategyStats<P: HasDims, S: Storable<P>, M: Storable<P>> {
     pub step_size: S,
     #[storable(flatten)]
     pub mass_matrix: M,
+    pub tuning: bool,
     #[storable(ignore)]
     _phantom: std::marker::PhantomData<fn() -> P>,
 }
@@ -243,6 +244,7 @@ where
                 self.step_size.extract_stats(math, ())
             },
             mass_matrix: self.mass_matrix.extract_stats(math, opt.mass_matrix),
+            tuning: self.tuning,
             _phantom: PhantomData,
         }
     }

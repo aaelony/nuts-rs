@@ -4,12 +4,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use nuts_storable::{ItemType, Value};
-use zarrs::array::{ArrayBuilder, DataType, FillValue};
-use zarrs::array_subset::ArraySubset;
+use zarrs::array::{ArrayBuilder, ArraySubset};
 use zarrs::group::GroupBuilder;
 use zarrs::storage::{ReadableWritableListableStorage, ReadableWritableListableStorageTraits};
 
-use super::common::{Chunk, SampleBuffer, SampleBufferValue};
+use super::common::{Chunk, SampleBuffer, SampleBufferValue, value_to_zarr_coord_params};
 use super::create_arrays;
 use crate::storage::{ChainStorage, StorageConfig, TraceStorage};
 use crate::{Math, Progress, Settings};
@@ -30,33 +29,28 @@ pub fn store_coords(
     coords: &HashMap<String, Value>,
 ) -> Result<()> {
     for (name, coord) in coords {
-        let (data_type, len, fill_value) = match coord {
-            &Value::F64(ref v) => (DataType::Float64, v.len(), FillValue::from(f64::NAN)),
-            &Value::F32(ref v) => (DataType::Float32, v.len(), FillValue::from(f32::NAN)),
-            &Value::U64(ref v) => (DataType::UInt64, v.len(), FillValue::from(0u64)),
-            &Value::I64(ref v) => (DataType::Int64, v.len(), FillValue::from(0i64)),
-            &Value::Bool(ref v) => (DataType::Bool, v.len(), FillValue::from(false)),
-            &Value::Strings(ref v) => (DataType::String, v.len(), FillValue::from("")),
-            _ => panic!("Unsupported coordinate type for {}", name),
-        };
+        let (data_type, len, fill_value) = value_to_zarr_coord_params(coord);
         let name: &String = name;
-        let coord_array = ArrayBuilder::new(
-            vec![len as u64],
-            data_type,
-            vec![len as u64].try_into().expect("Invalid chunk size"),
-            fill_value,
-        )
-        .dimension_names(Some(vec![name.to_string()]))
-        .build(store.clone(), &format!("{}/{}", group, name))?;
-        let subset = vec![0];
-        match coord {
-            &Value::F64(ref v) => coord_array.store_chunk_elements::<f64>(&subset, v)?,
-            &Value::F32(ref v) => coord_array.store_chunk_elements::<f32>(&subset, v)?,
-            &Value::U64(ref v) => coord_array.store_chunk_elements::<u64>(&subset, v)?,
-            &Value::I64(ref v) => coord_array.store_chunk_elements::<i64>(&subset, v)?,
-            &Value::Bool(ref v) => coord_array.store_chunk_elements::<bool>(&subset, v)?,
-            &Value::Strings(ref v) => coord_array.store_chunk_elements::<String>(&subset, v)?,
-            _ => unreachable!(),
+
+        let coord_array =
+            ArrayBuilder::new(vec![len as u64], vec![len as u64], data_type, fill_value)
+                .dimension_names(Some(vec![name.to_string()]))
+                .build(store.clone(), &format!("{}/{}", group, name))?;
+
+        if len > 0 {
+            let subset = vec![0];
+            match coord {
+                //&Value::F64(ref v) => coord_array.store_chunk_elements::<f64>(&subset, v)?,
+                &Value::F64(ref v) => coord_array.store_chunk(&subset, v)?,
+                &Value::F32(ref v) => coord_array.store_chunk(&subset, v)?,
+                &Value::U64(ref v) => coord_array.store_chunk(&subset, v)?,
+                &Value::I64(ref v) => coord_array.store_chunk(&subset, v)?,
+                &Value::Bool(ref v) => coord_array.store_chunk(&subset, v)?,
+                &Value::Strings(ref v) => coord_array.store_chunk(&subset, v)?,
+                &Value::DateTime64(_, ref data) => coord_array.store_chunk(&subset, data)?,
+                &Value::TimeDelta64(_, ref data) => coord_array.store_chunk(&subset, data)?,
+                _ => unreachable!(),
+            }
         }
         coord_array.store_metadata()?;
     }
@@ -91,13 +85,17 @@ fn store_zarr_chunk(array: &Array, data: Chunk, chain_chunk_index: u64) -> Resul
         .collect();
     let chunk = &chunk_vec[..];
 
+    if data.values.len() == 0 {
+        return Ok(());
+    }
+
     let result = if data.is_full() {
         match data.values {
-            SampleBufferValue::F64(v) => array.store_chunk_elements::<f64>(&chunk, &v),
-            SampleBufferValue::F32(v) => array.store_chunk_elements::<f32>(&chunk, &v),
-            SampleBufferValue::U64(v) => array.store_chunk_elements::<u64>(&chunk, &v),
-            SampleBufferValue::I64(v) => array.store_chunk_elements::<i64>(&chunk, &v),
-            SampleBufferValue::Bool(v) => array.store_chunk_elements::<bool>(&chunk, &v),
+            SampleBufferValue::F64(v) => array.store_chunk(&chunk, &v),
+            SampleBufferValue::F32(v) => array.store_chunk(&chunk, &v),
+            SampleBufferValue::U64(v) => array.store_chunk(&chunk, &v),
+            SampleBufferValue::I64(v) => array.store_chunk(&chunk, &v),
+            SampleBufferValue::Bool(v) => array.store_chunk(&chunk, &v),
         }
     } else {
         let mut shape: Vec<_> = array.shape().iter().cloned().collect();
@@ -108,23 +106,23 @@ fn store_zarr_chunk(array: &Array, data: Chunk, chain_chunk_index: u64) -> Resul
         match data.values {
             SampleBufferValue::F64(v) => {
                 assert!(v.len() == chunk_subset.num_elements_usize());
-                array.store_chunk_subset_elements(&chunk, &chunk_subset, &v)
+                array.store_chunk_subset(&chunk, &chunk_subset, &v)
             }
             SampleBufferValue::F32(v) => {
                 assert!(v.len() == chunk_subset.num_elements_usize());
-                array.store_chunk_subset_elements(&chunk, &chunk_subset, &v)
+                array.store_chunk_subset(&chunk, &chunk_subset, &v)
             }
             SampleBufferValue::U64(v) => {
                 assert!(v.len() == chunk_subset.num_elements_usize());
-                array.store_chunk_subset_elements(&chunk, &chunk_subset, &v)
+                array.store_chunk_subset(&chunk, &chunk_subset, &v)
             }
             SampleBufferValue::I64(v) => {
                 assert!(v.len() == chunk_subset.num_elements_usize());
-                array.store_chunk_subset_elements(&chunk, &chunk_subset, &v)
+                array.store_chunk_subset(&chunk, &chunk_subset, &v)
             }
             SampleBufferValue::Bool(v) => {
                 assert!(v.len() == chunk_subset.num_elements_usize());
-                array.store_chunk_subset_elements(&chunk, &chunk_subset, &v)
+                array.store_chunk_subset(&chunk, &chunk_subset, &v)
             }
         }
     };
@@ -531,6 +529,18 @@ impl TraceStorage for ZarrTraceStorage {
             if let Err(err) = trace {
                 return Ok((Some(err), ()));
             }
+        }
+        Ok((None, ()))
+    }
+
+    fn inspect(
+        &self,
+        traces: Vec<Result<Option<<Self::ChainStorage as ChainStorage>::Finalized>>>,
+    ) -> Result<(Option<anyhow::Error>, Self::Finalized)> {
+        for trace in traces {
+            if let Err(err) = trace {
+                return Ok((Some(err), ()));
+            };
         }
         Ok((None, ()))
     }

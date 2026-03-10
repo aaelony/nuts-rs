@@ -1,11 +1,12 @@
 use nuts_derive::Storable;
+use nuts_storable::{HasDims, Storable};
 use serde::Serialize;
 
 use crate::adapt_strategy::CombinedCollector;
 use crate::chain::AdaptStrategy;
 use crate::hamiltonian::{Hamiltonian, Point};
 use crate::nuts::{Collector, NutsOptions, SampleInfo};
-use crate::sampler_stats::SamplerStats;
+use crate::sampler_stats::{SamplerStats, StatsDims};
 use crate::state::State;
 use crate::stepsize::AcceptanceRateCollector;
 use crate::stepsize::{StepSizeSettings, Strategy as StepSizeStrategy};
@@ -43,14 +44,24 @@ pub struct TransformAdaptation {
 }
 
 #[derive(Debug, Storable)]
-pub struct Stats {}
+pub struct Stats<P: HasDims, S: Storable<P>> {
+    tuning: bool,
+    #[storable(flatten)]
+    pub step_size: S,
+    #[storable(ignore)]
+    _phantom: std::marker::PhantomData<fn() -> P>,
+}
 
 impl<M: Math> SamplerStats<M> for TransformAdaptation {
-    type Stats = Stats;
+    type Stats = Stats<StatsDims, <StepSizeStrategy as SamplerStats<M>>::Stats>;
     type StatsOptions = ();
 
-    fn extract_stats(&self, _math: &mut M, _opt: Self::StatsOptions) -> Self::Stats {
-        Stats {}
+    fn extract_stats(&self, math: &mut M, _opt: Self::StatsOptions) -> Self::Stats {
+        Stats {
+            tuning: self.tuning,
+            step_size: { self.step_size.extract_stats(math, ()) },
+            _phantom: std::marker::PhantomData,
+        }
     }
 }
 
@@ -197,7 +208,7 @@ impl<M: Math> AdaptStrategy<M> for TransformAdaptation {
 
         if draw < self.final_window_size {
             if draw < 100 {
-                if (draw > 0) & draw.is_multiple_of(10) {
+                if (draw > 0) && draw.is_multiple_of(10) {
                     hamiltonian.update_params(
                         math,
                         rng,
@@ -206,7 +217,7 @@ impl<M: Math> AdaptStrategy<M> for TransformAdaptation {
                         collector.collector2.logps.iter(),
                     )?;
                 }
-            } else if (draw > 0) & draw.is_multiple_of(self.options.transform_update_freq) {
+            } else if (draw > 0) && draw.is_multiple_of(self.options.transform_update_freq) {
                 hamiltonian.update_params(
                     math,
                     rng,

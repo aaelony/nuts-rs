@@ -30,6 +30,9 @@ impl NdarrayValue {
             ItemType::String => {
                 NdarrayValue::String(ArrayD::from_elem(IxDyn(shape), String::new()))
             }
+            ItemType::DateTime64(_) | ItemType::TimeDelta64(_) => {
+                NdarrayValue::I64(ArrayD::zeros(IxDyn(shape)))
+            }
         }
     }
 
@@ -136,6 +139,7 @@ struct SharedArrays {
 }
 
 /// Main storage for ndarray MCMC traces
+#[derive(Clone)]
 pub struct NdarrayTraceStorage {
     shared_arrays: Arc<Mutex<SharedArrays>>,
 }
@@ -191,6 +195,12 @@ impl NdarrayChainStorage {
 }
 
 pub struct NdarrayConfig {}
+
+impl Default for NdarrayConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl NdarrayConfig {
     pub fn new() -> Self {
@@ -322,10 +332,10 @@ impl TraceStorage for NdarrayTraceStorage {
         let mut first_error = None;
 
         for trace in traces {
-            if let Err(err) = trace {
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
+            if let Err(err) = trace
+                && first_error.is_none()
+            {
+                first_error = Some(err);
             }
         }
 
@@ -341,5 +351,21 @@ impl TraceStorage for NdarrayTraceStorage {
         };
 
         Ok((first_error, result))
+    }
+
+    fn inspect(
+        &self,
+        traces: Vec<Result<Option<<Self::ChainStorage as ChainStorage>::Finalized>>>,
+    ) -> Result<(Option<anyhow::Error>, Self::Finalized)> {
+        self.clone().finalize(
+            traces
+                .into_iter()
+                .map(|res| match res {
+                    Ok(Some(_)) => Ok(()),
+                    Ok(None) => Ok(()),
+                    Err(err) => Err(err),
+                })
+                .collect(),
+        )
     }
 }

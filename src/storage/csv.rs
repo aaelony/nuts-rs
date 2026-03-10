@@ -220,6 +220,8 @@ impl CsvChainStorage {
                     vec[0].clone()
                 }
             }
+            Value::DateTime64(_, _) => panic!("DateTime64 not supported in CSV output"),
+            Value::TimeDelta64(_, _) => panic!("TimeDelta64 not supported in CSV output"),
         }
     }
 
@@ -347,6 +349,12 @@ impl ChainStorage for CsvChainStorage {
         // BufWriter doesn't provide a way to flush without mutable reference
         // In practice, the buffer will be flushed when the file is closed
         Ok(())
+    }
+
+    fn inspect(&self) -> Result<Option<Self::Finalized>> {
+        // For CSV storage, inspection does not produce a finalized result
+        self.flush()?;
+        Ok(None)
     }
 }
 
@@ -599,6 +607,19 @@ impl TraceStorage for CsvTraceStorage {
         }
         Ok((None, ()))
     }
+
+    fn inspect(
+        &self,
+        traces: Vec<Result<Option<<Self::ChainStorage as ChainStorage>::Finalized>>>,
+    ) -> Result<(Option<anyhow::Error>, Self::Finalized)> {
+        // Check for any errors in the chain inspections
+        for trace_result in traces {
+            if let Err(err) = trace_result {
+                return Ok((Some(err), ()));
+            }
+        }
+        Ok((None, ()))
+    }
 }
 
 #[cfg(test)]
@@ -610,7 +631,7 @@ mod tests {
     use anyhow::Result;
     use nuts_derive::Storable;
     use nuts_storable::{HasDims, Value};
-    use rand::Rng;
+    use rand::{Rng, RngExt};
     use std::collections::HashMap;
     use std::fs;
     use std::path::Path;

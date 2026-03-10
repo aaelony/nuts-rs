@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::iter::repeat;
 
 use faer::{Col, ColRef, Mat, MatRef, Scale};
 use itertools::Itertools;
@@ -6,7 +7,7 @@ use nuts_derive::Storable;
 use serde::Serialize;
 
 use super::adapt::MassMatrixAdaptStrategy;
-use super::mass_matrix::{DrawGradCollector, MassMatrix};
+use super::diagonal::{DrawGradCollector, MassMatrix};
 use crate::{
     Math, NutsError, euclidean_hamiltonian::EuclideanPoint, hamiltonian::Point,
     sampler_stats::SamplerStats,
@@ -127,15 +128,17 @@ impl Default for LowRankSettings {
         Self {
             store_mass_matrix: false,
             gamma: 1e-5,
-            eigval_cutoff: 100f64,
+            eigval_cutoff: 2f64,
         }
     }
 }
 
 #[derive(Debug, Storable)]
 pub struct MatrixStats {
-    pub eigvals: Option<Vec<f64>>,
-    pub stds: Option<Vec<f64>>,
+    #[storable(dims("unconstrained_parameter"))]
+    pub mass_matrix_eigvals: Option<Vec<f64>>,
+    #[storable(dims("unconstrained_parameter"))]
+    pub mass_matrix_stds: Option<Vec<f64>>,
     pub num_eigenvalues: u64,
 }
 
@@ -145,14 +148,18 @@ impl<M: Math> SamplerStats<M> for LowRankMassMatrix<M> {
 
     fn extract_stats(&self, math: &mut M, _opt: Self::StatsOptions) -> Self::Stats {
         if self.settings.store_mass_matrix {
+            let stds = Some(math.box_array(&self.stds));
             let eigvals = self
                 .inner
                 .as_ref()
                 .map(|inner| math.eigs_as_array(&inner.vals));
-            let stds = Some(math.box_array(&self.stds));
+            let mut eigvals = eigvals.map(|x| x.into_vec());
+            if let Some(ref mut eigvals) = eigvals {
+                eigvals.extend(repeat(f64::NAN).take(stds.as_ref().unwrap().len() - eigvals.len()));
+            }
             MatrixStats {
-                eigvals: eigvals.map(|x| x.into_vec()),
-                stds: stds.map(|x| x.into_vec()),
+                mass_matrix_eigvals: eigvals,
+                mass_matrix_stds: stds.map(|x| x.into_vec()),
                 num_eigenvalues: self
                     .inner
                     .as_ref()
@@ -161,9 +168,13 @@ impl<M: Math> SamplerStats<M> for LowRankMassMatrix<M> {
             }
         } else {
             MatrixStats {
-                eigvals: None,
-                stds: None,
-                num_eigenvalues: 0,
+                mass_matrix_eigvals: None,
+                mass_matrix_stds: None,
+                num_eigenvalues: self
+                    .inner
+                    .as_ref()
+                    .map(|inner| inner.num_eigenvalues)
+                    .unwrap_or(0),
             }
         }
     }
@@ -328,7 +339,7 @@ impl LowRankMassMatrixStrategy {
 
 fn rescale_points(draws: &mut Mat<f64>, grads: &mut Mat<f64>) -> Col<f64> {
     let (ndim, ndraws) = draws.shape();
-    
+
     Col::from_fn(ndim, |col| {
         let draw_mean = draws.row(col).sum() / (ndraws as f64);
         let grad_mean = grads.row(col).sum() / (ndraws as f64);
@@ -502,7 +513,7 @@ mod test {
 
     use equator::Cmp;
     use faer::{Col, Mat, utils::approx::ApproxEq};
-    use rand::{Rng, SeedableRng, rngs::SmallRng};
+    use rand::{RngExt, SeedableRng, rngs::SmallRng};
     use rand_distr::StandardNormal;
 
     use super::{estimate_mass_matrix, mat_all_finite, spd_mean};
@@ -532,7 +543,7 @@ mod test {
         };
 
         faer::zip!(&out, &expected).for_each(|faer::unzip!(out, expected)| {
-            comp.test(out, expected).unwrap();
+            assert!(comp.test(out, expected));
         });
     }
 
@@ -559,7 +570,7 @@ mod test {
         let expected = Col::full(20, 1.);
 
         faer::zip!(&vals, &expected).for_each(|faer::unzip!(out, expected)| {
-            comp.test(out, expected).unwrap();
+            assert!(comp.test(out, expected));
         });
     }
 }

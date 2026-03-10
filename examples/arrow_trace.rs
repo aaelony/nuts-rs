@@ -1,30 +1,28 @@
-//! Zarr backend example for MCMC trace storage
+//! Arrow backend example for MCMC trace storage
 //!
-//! This example demonstrates how to use the nuts-rs library with Zarr storage
+//! This example demonstrates how to use the nuts-rs library with Arrow storage
 //! for running MCMC sampling on a multivariate normal distribution. It shows:
 //!
 //! - Setting up a custom probability model
-//! - Configuring Zarr storage for results
+//! - Configuring Arrow storage for results
 //! - Running multiple parallel chains
 //! - Monitoring progress during sampling
-//! - Saving results in ArviZ-compatible format
+//! - Accessing results in Arrow/Parquet format
 
 use std::{
     collections::HashMap,
     f64,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
 use nuts_rs::{
-    CpuLogpFunc, CpuMath, CpuMathError, DiagGradNutsSettings, LogpError, Model, Sampler,
-    SamplerWaitResult, Storable, ZarrConfig,
+    ArrowConfig, CpuLogpFunc, CpuMath, CpuMathError, DiagGradNutsSettings, LogpError, Model,
+    Sampler, SamplerWaitResult, Storable,
 };
 use nuts_storable::{HasDims, Value};
 use rand::{Rng, RngExt};
 use thiserror::Error;
-use zarrs::filesystem::FilesystemStore;
 
 /// A multivariate normal distribution model
 ///
@@ -76,13 +74,12 @@ impl HasDims for MvnLogp {
     /// Define dimension names and sizes for storage
     ///
     /// This tells the storage system what array dimensions to expect.
-    /// These dimensions will be used to structure the output data.
+    /// These dimensions will be used to structure the output data using
+    /// Arrow's FixedShapeTensor extension type.
     fn dim_sizes(&self) -> HashMap<String, u64> {
         HashMap::from([
             // Dimension for the actual parameter vector x
             ("x".to_string(), self.model.mean.len() as u64),
-            // Dimension for empty vector
-            ("empty".to_string(), 0),
         ])
     }
 
@@ -98,7 +95,8 @@ impl HasDims for MvnLogp {
 ///
 /// The `Storable` derive macro automatically generates code to store this
 /// struct in the trace. The `dims` attribute specifies which dimension
-/// each field should use.
+/// each field should use. Multi-dimensional fields will be stored as
+/// FixedShapeTensor extension types in Arrow format.
 #[derive(Storable)]
 struct ExpandedDraw {
     /// Store the parameter values with dimension "x"
@@ -106,9 +104,6 @@ struct ExpandedDraw {
     prec: Vec<f64>,
     /// A scalar derived quantity (difference between first two parameters)
     diff: f64,
-    /// An empty vector to demonstrate zero-length expanded variables
-    #[storable(dims("empty"))]
-    empty: Vec<f64>,
 }
 
 impl CpuLogpFunc for MvnLogp {
@@ -167,7 +162,6 @@ impl CpuLogpFunc for MvnLogp {
         Ok(ExpandedDraw {
             prec: array.to_vec(),
             diff: array[1] - array[0], // Example: difference between first two parameters
-            empty: vec![],
         })
     }
 
@@ -212,7 +206,7 @@ impl Model for MvnModel {
 }
 
 fn main() -> Result<()> {
-    println!("=== Multivariate Normal MCMC with Zarr Storage ===\n");
+    println!("=== Multivariate Normal MCMC with Arrow Storage ===\n");
 
     // Create a 2D multivariate normal distribution
     // This creates a distribution with mean [0, 0] and precision matrix
@@ -227,8 +221,8 @@ fn main() -> Result<()> {
     println!("Precision matrix: {:?}\n", mvn.precision);
 
     // Configure output location
-    let output_path = "mcmc_output/trace.zarr";
-    println!("Output will be saved to: {}\n", output_path);
+    let output_path = "mcmc_output";
+    println!("Output will be saved to: {}/\n", output_path);
 
     // Sampling configuration
     let num_chains = 4; // Run 4 parallel chains for better convergence assessment
@@ -248,11 +242,6 @@ fn main() -> Result<()> {
     settings.num_draws = num_draws as _;
     settings.seed = 54; // For reproducible results
 
-    // Set up Zarr storage
-    // FilesystemStore writes to a directory on disk in Zarr format
-    let store: zarrs::storage::ReadableWritableListableStorage =
-        Arc::new(FilesystemStore::new(&output_path)?);
-
     // Create the model instance
     let model = MvnModel {
         math: CpuMath::new(MvnLogp {
@@ -265,12 +254,12 @@ fn main() -> Result<()> {
     println!("\nStarting MCMC sampling...\n");
     let start = Instant::now();
 
-    // Configure Zarr storage with default settings
-    let zarr_config = ZarrConfig::new(store.clone());
+    // Configure Arrow storage - it automatically determines capacity from settings
+    let arrow_config = ArrowConfig::new();
 
     // Create sampler with 4 worker threads
     // The sampler runs asynchronously, so we can monitor progress
-    let mut sampler = Some(Sampler::new(model, settings, zarr_config, 4, None)?);
+    let mut sampler = Some(Sampler::new(model, settings, arrow_config, 4, None)?);
 
     let mut num_progress_updates = 0;
 
@@ -279,21 +268,47 @@ fn main() -> Result<()> {
     while let Some(sampler_) = sampler.take() {
         match sampler_.wait_timeout(Duration::from_millis(50)) {
             // Sampling completed successfully
-            SamplerWaitResult::Trace(_) => {
+            SamplerWaitResult::Trace(traces) => {
                 println!("✓ Sampling completed in {:?}", start.elapsed());
-                println!("✓ Traces written to Zarr format at '{}'", output_path);
 
-                // Provide instructions for analysis
-                println!("\n=== Next Steps ===");
-                println!("To analyze results in Python with ArviZ:");
-                println!("  import arviz as az");
-                println!("  data = az.from_zarr('{}')", output_path);
-                println!("  az.plot_trace(data)");
-                println!("  az.summary(data)");
-                println!("\nThe Zarr format contains:");
-                println!("  - posterior/: Main sampling results");
-                println!("  - sample_stats/: Sampler diagnostics");
-                println!("  - warmup_*: Warmup phase results");
+                // Display information about the resulting Arrow data
+                println!("✓ MCMC traces stored in Arrow format");
+                println!("\nTrace summary:");
+                println!("  Number of chains: {}", traces.len());
+
+                if let Some(first_trace) = traces.first() {
+                    println!(
+                        "  Posterior samples: {} rows, {} columns",
+                        first_trace.posterior.num_rows(),
+                        first_trace.posterior.num_columns()
+                    );
+                    println!(
+                        "  Sample stats: {} rows, {} columns",
+                        first_trace.sample_stats.num_rows(),
+                        first_trace.sample_stats.num_columns()
+                    );
+
+                    // Show column names
+                    println!("\n  Posterior columns:");
+                    for field in first_trace.posterior.schema().fields() {
+                        println!(
+                            "    {} ({} {:?})",
+                            field.name(),
+                            field.data_type(),
+                            field.metadata(),
+                        );
+                    }
+
+                    println!("\n  Sample stats columns:");
+                    for field in first_trace.sample_stats.schema().fields() {
+                        println!(
+                            "    {} ({} {:?})",
+                            field.name(),
+                            field.data_type(),
+                            field.metadata(),
+                        );
+                    }
+                }
                 break;
             }
 

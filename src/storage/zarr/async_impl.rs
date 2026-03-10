@@ -1,18 +1,22 @@
 use std::collections::HashMap;
 use std::iter::once;
+
 use std::sync::Arc;
-use tokio::task::JoinHandle;
+use tokio::runtime::Handle;
+use tokio::task::JoinSet;
 
 use anyhow::{Context, Result};
 use nuts_storable::{ItemType, Value};
-use zarrs::array::{ArrayBuilder, DataType, FillValue};
-use zarrs::array_subset::ArraySubset;
+use zarrs::array::{ArrayBuilder, ArraySubset};
 use zarrs::group::GroupBuilder;
+
 use zarrs::storage::{
     AsyncReadableWritableListableStorage, AsyncReadableWritableListableStorageTraits,
 };
 
-use super::common::{Chunk, SampleBuffer, SampleBufferValue, create_arrays};
+use super::common::{
+    Chunk, SampleBuffer, SampleBufferValue, create_arrays, value_to_zarr_coord_params,
+};
 use crate::storage::{ChainStorage, StorageConfig, TraceStorage};
 use crate::{Math, Progress, Settings};
 
@@ -41,8 +45,9 @@ pub struct ZarrAsyncChainStorage {
     arrays: Arc<ArrayCollection>,
     chain: u64,
     last_sample_was_warmup: bool,
-    pending_writes: Vec<JoinHandle<Result<()>>>,
+    pending_writes: Arc<tokio::sync::Mutex<JoinSet<Result<()>>>>,
     rt_handle: tokio::runtime::Handle,
+    max_queued_writes: usize,
 }
 
 /// Write a chunk of data to a Zarr array asynchronously
@@ -56,15 +61,17 @@ async fn store_zarr_chunk_async(array: Array, data: Chunk, chain_chunk_index: u6
         .collect();
     let chunk = &chunk_vec[..];
 
+    if data.values.len() == 0 {
+        return Ok(());
+    }
+
     let result = if data.is_full() {
         match data.values {
-            SampleBufferValue::F64(v) => array.async_store_chunk_elements::<f64>(&chunk, &v).await,
-            SampleBufferValue::F32(v) => array.async_store_chunk_elements::<f32>(&chunk, &v).await,
-            SampleBufferValue::U64(v) => array.async_store_chunk_elements::<u64>(&chunk, &v).await,
-            SampleBufferValue::I64(v) => array.async_store_chunk_elements::<i64>(&chunk, &v).await,
-            SampleBufferValue::Bool(v) => {
-                array.async_store_chunk_elements::<bool>(&chunk, &v).await
-            }
+            SampleBufferValue::F64(v) => array.async_store_chunk(&chunk, &v).await,
+            SampleBufferValue::F32(v) => array.async_store_chunk(&chunk, &v).await,
+            SampleBufferValue::U64(v) => array.async_store_chunk(&chunk, &v).await,
+            SampleBufferValue::I64(v) => array.async_store_chunk(&chunk, &v).await,
+            SampleBufferValue::Bool(v) => array.async_store_chunk(&chunk, &v).await,
         }
     } else {
         let mut shape: Vec<_> = array.shape().iter().cloned().collect();
@@ -76,42 +83,44 @@ async fn store_zarr_chunk_async(array: Array, data: Chunk, chain_chunk_index: u6
             SampleBufferValue::F64(v) => {
                 assert!(v.len() == chunk_subset.num_elements_usize());
                 array
-                    .async_store_chunk_subset_elements(&chunk, &chunk_subset, &v)
+                    .async_store_chunk_subset(&chunk, &chunk_subset, &v)
                     .await
             }
             SampleBufferValue::F32(v) => {
                 assert!(v.len() == chunk_subset.num_elements_usize());
                 array
-                    .async_store_chunk_subset_elements(&chunk, &chunk_subset, &v)
+                    .async_store_chunk_subset(&chunk, &chunk_subset, &v)
                     .await
             }
             SampleBufferValue::U64(v) => {
                 assert!(v.len() == chunk_subset.num_elements_usize());
                 array
-                    .async_store_chunk_subset_elements(&chunk, &chunk_subset, &v)
+                    .async_store_chunk_subset(&chunk, &chunk_subset, &v)
                     .await
             }
             SampleBufferValue::I64(v) => {
                 assert!(v.len() == chunk_subset.num_elements_usize());
                 array
-                    .async_store_chunk_subset_elements(&chunk, &chunk_subset, &v)
+                    .async_store_chunk_subset(&chunk, &chunk_subset, &v)
                     .await
             }
             SampleBufferValue::Bool(v) => {
                 assert!(v.len() == chunk_subset.num_elements_usize());
                 array
-                    .async_store_chunk_subset_elements(&chunk, &chunk_subset, &v)
+                    .async_store_chunk_subset(&chunk, &chunk_subset, &v)
                     .await
             }
         }
     };
 
-    result.context(format!(
-        "Failed to store chunk for variable {} at chunk {} with length {}",
-        array.path(),
-        data.chunk_idx,
-        data.len
-    ))?;
+    result.with_context(|| {
+        format!(
+            "Failed to store chunk for variable {} at chunk {} with length {}",
+            array.path(),
+            data.chunk_idx,
+            data.len
+        )
+    })?;
     Ok(())
 }
 
@@ -123,13 +132,7 @@ fn store_zarr_chunk_sync(
     chain_chunk_index: u64,
 ) -> Result<()> {
     let array = array.clone();
-    handle.block_on(async move {
-        tokio::runtime::Handle::current().block_on(store_zarr_chunk_async(
-            array,
-            data,
-            chain_chunk_index,
-        ))
-    })
+    handle.block_on(async move { store_zarr_chunk_async(array, data, chain_chunk_index).await })
 }
 
 /// Store coordinates in zarr arrays
@@ -139,59 +142,107 @@ async fn store_coords(
     coords: &HashMap<String, Value>,
 ) -> Result<()> {
     for (name, coord) in coords {
-        let (data_type, len, fill_value) = match coord {
-            &Value::F64(ref v) => (DataType::Float64, v.len(), FillValue::from(f64::NAN)),
-            &Value::F32(ref v) => (DataType::Float32, v.len(), FillValue::from(f32::NAN)),
-            &Value::U64(ref v) => (DataType::UInt64, v.len(), FillValue::from(0u64)),
-            &Value::I64(ref v) => (DataType::Int64, v.len(), FillValue::from(0i64)),
-            &Value::Bool(ref v) => (DataType::Bool, v.len(), FillValue::from(false)),
-            &Value::Strings(ref v) => (DataType::String, v.len(), FillValue::from("")),
-            _ => panic!("Unsupported coordinate type for {}", name),
-        };
+        let (data_type, len, fill_value) = value_to_zarr_coord_params(coord);
         let name: &String = name;
         let coord_array = ArrayBuilder::new(
             vec![len as u64],
+            vec![(len as u64).max(1)],
             data_type,
-            vec![len as u64].try_into().expect("Invalid chunk size"),
             fill_value,
         )
         .dimension_names(Some(vec![name.to_string()]))
-        .build(store.clone(), &format!("{}/{}", group, name))?;
-        let subset = vec![0];
-        match coord {
-            &Value::F64(ref v) => {
-                coord_array
-                    .async_store_chunk_elements::<f64>(&subset, v)
-                    .await?
+        .build(store.clone(), &format!("{}/{}", group, name))
+        .with_context(|| {
+            format!(
+                "Failed to create coordinate array for {} in group {}",
+                name, group
+            )
+        })?;
+
+        if len > 0 {
+            let subset = vec![0];
+            match coord {
+                &Value::F64(ref v) => coord_array
+                    .async_store_chunk(&subset, v)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to store chunk for float64 coordinate {} in group {}",
+                            name, group
+                        )
+                    })?,
+                &Value::F32(ref v) => coord_array
+                    .async_store_chunk(&subset, v)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to store chunk for float32 coordinate {} in group {}",
+                            name, group
+                        )
+                    })?,
+                &Value::U64(ref v) => coord_array
+                    .async_store_chunk(&subset, v)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to store chunk for uint64 coordinate {} in group {}",
+                            name, group
+                        )
+                    })?,
+                &Value::I64(ref v) => coord_array
+                    .async_store_chunk(&subset, v)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to store chunk for int64 coordinate {} in group {}",
+                            name, group
+                        )
+                    })?,
+                &Value::Bool(ref v) => coord_array
+                    .async_store_chunk(&subset, v)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to store chunk for bool coordinate {} in group {}",
+                            name, group
+                        )
+                    })?,
+                &Value::Strings(ref v) => coord_array
+                    .async_store_chunk(&subset, v)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to store chunk for string coordinate {} in group {}",
+                            name, group
+                        )
+                    })?,
+                &Value::DateTime64(_, ref data) => coord_array
+                    .async_store_chunk(&subset, data)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to store chunk for datetime coordinate {} in group {}",
+                            name, group
+                        )
+                    })?,
+                &Value::TimeDelta64(_, ref data) => coord_array
+                    .async_store_chunk(&subset, data)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to store chunk for time delta coordinate {} in group {}",
+                            name, group
+                        )
+                    })?,
+                _ => unreachable!(),
             }
-            &Value::F32(ref v) => {
-                coord_array
-                    .async_store_chunk_elements::<f32>(&subset, v)
-                    .await?
-            }
-            &Value::U64(ref v) => {
-                coord_array
-                    .async_store_chunk_elements::<u64>(&subset, v)
-                    .await?
-            }
-            &Value::I64(ref v) => {
-                coord_array
-                    .async_store_chunk_elements::<i64>(&subset, v)
-                    .await?
-            }
-            &Value::Bool(ref v) => {
-                coord_array
-                    .async_store_chunk_elements::<bool>(&subset, v)
-                    .await?
-            }
-            &Value::Strings(ref v) => {
-                coord_array
-                    .async_store_chunk_elements::<String>(&subset, v)
-                    .await?
-            }
-            _ => unreachable!(),
         }
-        coord_array.async_store_metadata().await?;
+        coord_array.async_store_metadata().await.with_context(|| {
+            format!(
+                "Failed to write metadata for coordinate {} in group {}",
+                name, group
+            )
+        })?;
     }
     Ok(())
 }
@@ -206,22 +257,28 @@ impl ZarrAsyncChainStorage {
         chain: u64,
         rt_handle: tokio::runtime::Handle,
     ) -> Self {
-        let draw_buffers = draw_types
+        let draw_buffers: HashMap<String, SampleBuffer> = draw_types
             .iter()
             .map(|(name, item_type)| (name.clone(), SampleBuffer::new(*item_type, buffer_size)))
             .collect();
 
-        let stats_buffers = param_types
+        let stats_buffers: HashMap<String, SampleBuffer> = param_types
             .iter()
             .map(|(name, item_type)| (name.clone(), SampleBuffer::new(*item_type, buffer_size)))
             .collect();
+
+        let num_arrays = draw_buffers.len() + stats_buffers.len();
+
         Self {
             draw_buffers,
             stats_buffers,
             arrays,
             chain,
             last_sample_was_warmup: true,
-            pending_writes: Vec::new(),
+            pending_writes: Arc::new(tokio::sync::Mutex::new(JoinSet::new())),
+            // We allow up to the number of arrays in pending writes, so
+            // that we queue one write per draw.
+            max_queued_writes: num_arrays.max(1),
             rt_handle,
         }
     }
@@ -241,10 +298,15 @@ impl ZarrAsyncChainStorage {
                 self.arrays.sample_param_arrays[name].clone()
             };
             let chain = self.chain;
-            let handle = self
-                .rt_handle
-                .spawn(async move { store_zarr_chunk_async(array, chunk, chain).await });
-            self.pending_writes.push(handle);
+
+            queue_write(
+                &self.rt_handle,
+                self.pending_writes.clone(),
+                self.max_queued_writes,
+                array,
+                chunk,
+                chain,
+            )?;
         }
         Ok(())
     }
@@ -264,13 +326,55 @@ impl ZarrAsyncChainStorage {
                 self.arrays.sample_draw_arrays[name].clone()
             };
             let chain = self.chain;
-            let handle = self
-                .rt_handle
-                .spawn(async move { store_zarr_chunk_async(array, chunk, chain).await });
-            self.pending_writes.push(handle);
+
+            queue_write(
+                &self.rt_handle,
+                self.pending_writes.clone(),
+                self.max_queued_writes,
+                array,
+                chunk,
+                chain,
+            )?;
         }
         Ok(())
     }
+}
+
+fn queue_write(
+    handle: &Handle,
+    queue: Arc<tokio::sync::Mutex<JoinSet<Result<()>>>>,
+    max_queued_writes: usize,
+    array: Array,
+    chunk: Chunk,
+    chain: u64,
+) -> Result<()> {
+    let rt_handle = handle.clone();
+    // We need an async task to interface with the async storage
+    // and JoinSet API.
+    let spawn_write_task = handle.spawn(async move {
+        // This should never actually block, because this lock
+        // is only held in tasks that are spawned and immediately blocked_on
+        // from the sampling thread.
+        let mut writes_guard = queue.lock().await;
+
+        while writes_guard.len() >= max_queued_writes {
+            let out = writes_guard.join_next().await;
+            if let Some(out) = out {
+                out.context("Failed to await previous trace write operation")?
+                    .context("Chunk write operation failed")?;
+            } else {
+                break;
+            }
+        }
+        writes_guard.spawn_on(
+            async move { store_zarr_chunk_async(array, chunk, chain).await },
+            &rt_handle,
+        );
+        Ok(())
+    });
+    let res: Result<()> = handle.block_on(spawn_write_task)?;
+    res?;
+    Ok(())
 }
 
 impl ChainStorage for ZarrAsyncChainStorage {
@@ -289,20 +393,30 @@ impl ChainStorage for ZarrAsyncChainStorage {
                 if let Some(chunk) = buffer.reset() {
                     let array = self.arrays.warmup_draw_arrays[key].clone();
                     let chain = self.chain;
-                    let handle = self
-                        .rt_handle
-                        .spawn(async move { store_zarr_chunk_async(array, chunk, chain).await });
-                    self.pending_writes.push(handle);
+
+                    queue_write(
+                        &self.rt_handle,
+                        self.pending_writes.clone(),
+                        self.max_queued_writes,
+                        array,
+                        chunk,
+                        chain,
+                    )?;
                 }
             }
             for (key, buffer) in self.stats_buffers.iter_mut() {
                 if let Some(chunk) = buffer.reset() {
                     let array = self.arrays.warmup_param_arrays[key].clone();
                     let chain = self.chain;
-                    let handle = self
-                        .rt_handle
-                        .spawn(async move { store_zarr_chunk_async(array, chunk, chain).await });
-                    self.pending_writes.push(handle);
+
+                    queue_write(
+                        &self.rt_handle,
+                        self.pending_writes.clone(),
+                        self.max_queued_writes,
+                        array,
+                        chunk,
+                        chain,
+                    )?;
                 }
             }
             self.last_sample_was_warmup = false;
@@ -348,11 +462,14 @@ impl ChainStorage for ZarrAsyncChainStorage {
         }
 
         // Join all pending writes
+        // All tasks that hold a reference to the queue are blocked_on
+        // right away, so we hold the only refercne to `self.pending_writes`.
+        let pending_writes = Arc::into_inner(self.pending_writes)
+            .expect("Could not take ownership of pending writes queue")
+            .into_inner();
         self.rt_handle.block_on(async move {
-            for join_handle in self.pending_writes {
-                let _ = join_handle
-                    .await
-                    .context("Failed to await async chunk write operation")?;
+            for join_handle in pending_writes.join_all().await {
+                let _ = join_handle.context("Failed to await async chunk write operation")?;
             }
             Ok::<(), anyhow::Error>(())
         })?;
@@ -385,6 +502,21 @@ impl ChainStorage for ZarrAsyncChainStorage {
                 store_zarr_chunk_sync(&self.rt_handle, array, temp_chunk, self.chain)?;
             }
         }
+
+        // Join all pending writes
+        let pending_writes = self.pending_writes.clone();
+        self.rt_handle.block_on(async move {
+            let mut pending_writes = pending_writes.lock().await;
+            loop {
+                let Some(join_handle) = pending_writes.join_next().await else {
+                    break;
+                };
+                join_handle
+                    .context("Failed to await async chunk write operation")?
+                    .context("Chunk write operation failed")?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })?;
 
         Ok(())
     }
@@ -501,19 +633,23 @@ impl StorageConfig for ZarrAsyncConfig {
             root.async_store_metadata().await?;
 
             GroupBuilder::new()
-                .build(store.clone(), &format!("{}warmup_posterior", group_path))?
+                .build(store.clone(), &format!("{}warmup_posterior", group_path))
+                .context("Failed to create warmup_posterior group")?
                 .async_store_metadata()
                 .await?;
             GroupBuilder::new()
-                .build(store.clone(), &format!("{}warmup_sample_stats", group_path))?
+                .build(store.clone(), &format!("{}warmup_sample_stats", group_path))
+                .context("Failed to create warmup_sample_stats group")?
                 .async_store_metadata()
                 .await?;
             GroupBuilder::new()
-                .build(store.clone(), &format!("{}posterior", group_path))?
+                .build(store.clone(), &format!("{}posterior", group_path))
+                .context("Failed to create posterior group")?
                 .async_store_metadata()
                 .await?;
             GroupBuilder::new()
-                .build(store.clone(), &format!("{}sample_stats", group_path))?
+                .build(store.clone(), &format!("{}sample_stats", group_path))
+                .context("Failed to create sample_stats group")?
                 .async_store_metadata()
                 .await?;
 
@@ -526,7 +662,8 @@ impl StorageConfig for ZarrAsyncConfig {
                 n_tune,
                 &stat_dim_sizes,
                 self.draw_chunk_size,
-            )?;
+            )
+            .context("Failed to create warmup_param_arrays")?;
             let sample_param_arrays = create_arrays(
                 store.clone(),
                 &format!("{}sample_stats", group_path),
@@ -536,7 +673,8 @@ impl StorageConfig for ZarrAsyncConfig {
                 n_draws,
                 &stat_dim_sizes,
                 self.draw_chunk_size,
-            )?;
+            )
+            .context("Failed to create sample_param_arrays")?;
             let warmup_draw_arrays = create_arrays(
                 store.clone(),
                 &format!("{}warmup_posterior", group_path),
@@ -546,7 +684,8 @@ impl StorageConfig for ZarrAsyncConfig {
                 n_tune,
                 &draw_dim_sizes,
                 self.draw_chunk_size,
-            )?;
+            )
+            .context("Failed to create warmup_draw_arrays")?;
             let sample_draw_arrays = create_arrays(
                 store.clone(),
                 &format!("{}posterior", group_path),
@@ -556,7 +695,8 @@ impl StorageConfig for ZarrAsyncConfig {
                 n_draws,
                 &draw_dim_sizes,
                 self.draw_chunk_size,
-            )?;
+            )
+            .context("Failed to create sample_draw_arrays")?;
             // add arc around each value
             let warmup_param_arrays: HashMap<_, _> = warmup_param_arrays
                 .into_iter()
@@ -597,25 +737,29 @@ impl StorageConfig for ZarrAsyncConfig {
                 format!("{}posterior", &group_path),
                 &draw_coords,
             )
-            .await?;
+            .await
+            .context("Failed to store posterior coordinates")?;
             store_coords(
                 store.clone(),
                 format!("{}warmup_posterior", &group_path),
                 &draw_coords,
             )
-            .await?;
+            .await
+            .context("Failed to store warmup_posterior coordinates")?;
             store_coords(
                 store.clone(),
                 format!("{}sample_stats", &group_path),
                 &stat_coords,
             )
-            .await?;
+            .await
+            .context("Failed to store sample_stats coordinates")?;
             store_coords(
                 store.clone(),
                 format!("{}warmup_sample_stats", &group_path),
                 &stat_coords,
             )
-            .await?;
+            .await
+            .context("Failed to store warmup_sample_stats coordinates")?;
             Ok(ZarrAsyncTraceStorage {
                 arrays: Arc::new(trace_storage),
                 param_types,
@@ -651,6 +795,18 @@ impl TraceStorage for ZarrAsyncTraceStorage {
             if let Err(err) = trace {
                 return Ok((Some(err), ()));
             }
+        }
+        Ok((None, ()))
+    }
+
+    fn inspect(
+        &self,
+        traces: Vec<Result<Option<<Self::ChainStorage as ChainStorage>::Finalized>>>,
+    ) -> Result<(Option<anyhow::Error>, Self::Finalized)> {
+        for trace in traces {
+            if let Err(err) = trace {
+                return Ok((Some(err), ()));
+            };
         }
         Ok((None, ()))
     }
