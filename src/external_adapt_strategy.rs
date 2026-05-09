@@ -1,20 +1,21 @@
+//! Adaptation strategy for when the coordinate transformation is learned from data rather than computed analytically.
+
 use nuts_derive::Storable;
 use nuts_storable::{HasDims, Storable};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::adapt_strategy::CombinedCollector;
 use crate::chain::AdaptStrategy;
-use crate::hamiltonian::{Hamiltonian, Point};
+use crate::dynamics::{Hamiltonian, Point, State, TransformedHamiltonian, TransformedPoint};
 use crate::nuts::{Collector, NutsOptions, SampleInfo};
 use crate::sampler_stats::{SamplerStats, StatsDims};
-use crate::state::State;
 use crate::stepsize::AcceptanceRateCollector;
 use crate::stepsize::{StepSizeSettings, Strategy as StepSizeStrategy};
-use crate::transformed_hamiltonian::TransformedHamiltonian;
+use crate::transform::ExternalTransformation;
 use crate::{Math, NutsError};
 
-#[derive(Clone, Copy, Debug, Serialize)]
-pub struct TransformedSettings {
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct FlowSettings {
     pub step_size_window: f64,
     pub transform_update_freq: u64,
     pub use_orbit_for_training: bool,
@@ -22,7 +23,11 @@ pub struct TransformedSettings {
     pub transform_train_max_energy_error: f64,
 }
 
-impl Default for TransformedSettings {
+/// Backwards-compatible alias for [`FlowSettings`].
+#[deprecated(since = "0.0.0", note = "Use FlowSettings instead")]
+pub type TransformedSettings = FlowSettings;
+
+impl Default for FlowSettings {
     fn default() -> Self {
         Self {
             step_size_window: 0.07f64,
@@ -34,9 +39,9 @@ impl Default for TransformedSettings {
     }
 }
 
-pub struct TransformAdaptation {
+pub struct ExternalTransformAdaptation {
     step_size: StepSizeStrategy,
-    options: TransformedSettings,
+    options: FlowSettings,
     num_tune: u64,
     final_window_size: u64,
     tuning: bool,
@@ -52,7 +57,7 @@ pub struct Stats<P: HasDims, S: Storable<P>> {
     _phantom: std::marker::PhantomData<fn() -> P>,
 }
 
-impl<M: Math> SamplerStats<M> for TransformAdaptation {
+impl<M: Math> SamplerStats<M> for ExternalTransformAdaptation {
     type Stats = Stats<StatsDims, <StepSizeStrategy as SamplerStats<M>>::Stats>;
     type StatsOptions = ();
 
@@ -147,17 +152,13 @@ impl<M: Math, P: Point<M>> Collector<M, P> for DrawCollector<M> {
     }
 }
 
-impl<M: Math> AdaptStrategy<M> for TransformAdaptation {
-    type Hamiltonian = TransformedHamiltonian<M>;
+impl<M: Math> AdaptStrategy<M> for ExternalTransformAdaptation {
+    type Hamiltonian = TransformedHamiltonian<M, ExternalTransformation<M>>;
 
-    type Collector = CombinedCollector<
-        M,
-        <Self::Hamiltonian as Hamiltonian<M>>::Point,
-        AcceptanceRateCollector,
-        DrawCollector<M>,
-    >;
+    type Collector =
+        CombinedCollector<M, TransformedPoint<M>, AcceptanceRateCollector, DrawCollector<M>>;
 
-    type Options = TransformedSettings;
+    type Options = FlowSettings;
 
     fn new(_math: &mut M, options: Self::Options, num_tune: u64, chain: u64) -> Self {
         let step_size = StepSizeStrategy::new(options.step_size_settings);

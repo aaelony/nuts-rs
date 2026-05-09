@@ -1,13 +1,13 @@
+//! Implement the recursive doubling tree expansion that is the heart of the NUTS algorithm.
+
 use rand::RngExt;
+use rand_distr::num_traits::ToPrimitive;
 use thiserror::Error;
 
 use std::{fmt::Debug, marker::PhantomData};
 
-use crate::hamiltonian::{Direction, DivergenceInfo, Hamiltonian, LeapfrogResult, Point};
-use crate::math::logaddexp;
-use crate::state::State;
-
-use crate::math_base::Math;
+use crate::dynamics::{Direction, DivergenceInfo, Hamiltonian, LeapfrogResult, Point, State};
+use crate::math::{Math, logaddexp};
 
 #[non_exhaustive]
 #[derive(Error, Debug)]
@@ -54,9 +54,6 @@ pub struct SampleInfo {
     /// Whether the trajectory was terminated because it reached
     /// the maximum tree depth.
     pub reached_maxdepth: bool,
-
-    pub initial_energy: f64,
-    pub draw_energy: f64,
 }
 
 /// A part of the trajectory tree during NUTS sampling.
@@ -121,7 +118,7 @@ impl<M: Math, H: Hamiltonian<M>, C: Collector<M, H::Point>> NutsTree<M, H, C> {
         H: Hamiltonian<M>,
         R: rand::Rng + ?Sized,
     {
-        let mut other = match self.single_step(math, hamiltonian, direction, collector) {
+        let mut other = match self.single_step(math, hamiltonian, direction, options, collector) {
             Ok(Ok(tree)) => tree,
             Ok(Err(info)) => return ExtendResult::Diverging(self, info),
             Err(err) => return ExtendResult::Err(err),
@@ -214,13 +211,22 @@ impl<M: Math, H: Hamiltonian<M>, C: Collector<M, H::Point>> NutsTree<M, H, C> {
         math: &mut M,
         hamiltonian: &mut H,
         direction: Direction,
+        options: &NutsOptions,
         collector: &mut C,
     ) -> Result<std::result::Result<NutsTree<M, H, C>, DivergenceInfo>> {
         let start = match direction {
             Direction::Forward => &self.right,
             Direction::Backward => &self.left,
         };
-        let end = match hamiltonian.leapfrog(math, start, direction, collector) {
+        let end = match hamiltonian.leapfrog(
+            math,
+            start,
+            direction,
+            1.0,
+            start.point().initial_energy(),
+            options.max_energy_error,
+            collector,
+        ) {
             LeapfrogResult::Divergence(info) => return Ok(Err(info)),
             LeapfrogResult::Err(err) => return Err(NutsError::LogpFailure(err.into())),
             LeapfrogResult::Ok(end) => end,
@@ -243,19 +249,19 @@ impl<M: Math, H: Hamiltonian<M>, C: Collector<M, H::Point>> NutsTree<M, H, C> {
             depth: self.depth,
             divergence_info,
             reached_maxdepth: maxdepth,
-            initial_energy: self.draw.point().initial_energy(),
-            draw_energy: self.draw.energy(),
         }
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct NutsOptions {
     pub maxdepth: u64,
     pub mindepth: u64,
-    pub store_gradient: bool,
-    pub store_unconstrained: bool,
     pub check_turning: bool,
     pub store_divergences: bool,
+    pub target_integration_time: Option<f64>,
+    pub extra_doublings: u64,
+    pub max_energy_error: f64,
 }
 
 impl Default for NutsOptions {
@@ -263,10 +269,11 @@ impl Default for NutsOptions {
         NutsOptions {
             maxdepth: 10,
             mindepth: 0,
-            store_gradient: false,
-            store_unconstrained: false,
             check_turning: true,
             store_divergences: false,
+            target_integration_time: None,
+            extra_doublings: 0,
+            max_energy_error: 1000.0,
         }
     }
 }
@@ -285,10 +292,32 @@ where
     R: rand::Rng + ?Sized,
     C: Collector<M, H::Point>,
 {
-    hamiltonian.initialize_trajectory(math, init, rng)?;
+    hamiltonian.initialize_trajectory(math, init, true, rng)?;
     collector.register_init(math, init, options);
 
     let mut tree = NutsTree::new(init.clone());
+
+    let (mindepth, maxdepth) = if let Some(target_time) = options.target_integration_time {
+        let step_size = hamiltonian.step_size();
+        let max_steps = (target_time / step_size).ceil() as u64;
+        let mindepth = (max_steps as f64)
+            .log2()
+            .floor()
+            .to_u64()
+            .unwrap()
+            .max(options.mindepth);
+        let maxdepth = (max_steps as f64)
+            .log2()
+            .ceil()
+            .to_u64()
+            .unwrap()
+            .max(mindepth)
+            .min(options.maxdepth);
+
+        (mindepth, maxdepth)
+    } else {
+        (options.mindepth, options.maxdepth)
+    };
 
     if math.dim() == 0 {
         let info = tree.info(false, None);
@@ -301,9 +330,9 @@ where
         ..*options
     };
 
-    while tree.depth < options.maxdepth {
+    while tree.depth < maxdepth {
         let direction: Direction = rng.random();
-        let current_options = if tree.depth < options.mindepth {
+        let current_options = if tree.depth < mindepth {
             &options_no_check
         } else {
             options
@@ -317,7 +346,28 @@ where
             current_options,
         ) {
             ExtendResult::Ok(tree) => tree,
-            ExtendResult::Turning(tree) => {
+            ExtendResult::Turning(mut tree) => {
+                for _ in 0..options.extra_doublings {
+                    tree = match tree.extend(
+                        math,
+                        rng,
+                        hamiltonian,
+                        direction,
+                        collector,
+                        &options_no_check,
+                    ) {
+                        ExtendResult::Ok(tree) => tree,
+                        ExtendResult::Turning(tree) => tree,
+                        ExtendResult::Diverging(tree, info) => {
+                            let info = tree.info(false, Some(info));
+                            collector.register_draw(math, &tree.draw, &info);
+                            return Ok((tree.draw, info));
+                        }
+                        ExtendResult::Err(error) => {
+                            return Err(error);
+                        }
+                    }
+                }
                 let info = tree.info(false, None);
                 collector.register_draw(math, &tree.draw, &info);
                 return Ok((tree.draw, info));
@@ -342,8 +392,8 @@ mod tests {
     use rand::rng;
 
     use crate::{
-        Chain, Settings, adapt_strategy::test_logps::NormalLogp, cpu_math::CpuMath,
-        sampler::DiagGradNutsSettings,
+        Chain, Settings, math::test_logps::NormalLogp, math::CpuMath,
+        sampler::DiagNutsSettings,
     };
 
     #[test]
@@ -352,10 +402,12 @@ mod tests {
         let func = NormalLogp::new(ndim, 3.);
         let math = CpuMath::new(func);
 
-        let settings = DiagGradNutsSettings::default();
+        let settings = DiagNutsSettings::default();
         let mut rng = rng();
 
         let mut chain = settings.new_chain(0, math, &mut rng);
+
+        chain.set_position(&vec![0.0; ndim]).unwrap();
 
         let (_, mut progress) = chain.draw().unwrap();
         for _ in 0..10 {

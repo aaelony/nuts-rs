@@ -1,3 +1,5 @@
+//! Define the backend interface that decouples the sampler from any particular hardware or logp implementation.
+
 use std::{error::Error, fmt::Debug};
 
 use nuts_storable::{HasDims, Storable, Value};
@@ -102,11 +104,45 @@ pub trait Math: HasDims {
         data.into()
     }
 
+    /// Compute the sum of the natural logarithms of all elements in `array`,
+    /// i.e. `Σ ln(array[i])`.
+    ///
+    /// The default implementation copies into a temporary allocation via
+    /// [`write_to_slice`]; backends may override this with a zero-allocation
+    /// version.
+    fn array_sum_ln(&mut self, array: &Self::Vector) -> f64 {
+        let mut data = vec![0f64; self.dim()];
+        self.write_to_slice(array, &mut data);
+        data.iter().map(|x| x.ln()).sum()
+    }
+
     fn fill_array(&mut self, array: &mut Self::Vector, val: f64);
 
     fn array_all_finite(&mut self, array: &Self::Vector) -> bool;
     fn array_all_finite_and_nonzero(&mut self, array: &Self::Vector) -> bool;
     fn array_mult(&mut self, array1: &Self::Vector, array2: &Self::Vector, dest: &mut Self::Vector);
+    fn array_mult_inplace(&mut self, array1: &mut Self::Vector, array2: &Self::Vector);
+    fn array_recip(&mut self, array: &Self::Vector, dest: &mut Self::Vector);
+
+    /// Apply the low-rank linear map `(I + U * (diag(vals) - I) * U^T) * rhs` into `dest`.
+    ///
+    /// `vecs` is `U` (d × r, orthonormal columns), `vals` is the diagonal vector (length r).
+    /// When `vecs` has zero columns the result is just a copy of `rhs`.
+    fn apply_lowrank_transform(
+        &mut self,
+        vecs: &Self::EigVectors,
+        vals: &Self::EigValues,
+        rhs: &Self::Vector,
+        dest: &mut Self::Vector,
+    );
+
+    fn apply_lowrank_transform_inplace(
+        &mut self,
+        vecs: &Self::EigVectors,
+        vals: &Self::EigValues,
+        rhs_and_dest: &mut Self::Vector,
+    );
+
     fn array_mult_eigs(
         &mut self,
         stds: &Self::Vector,
@@ -115,6 +151,64 @@ pub trait Math: HasDims {
         vecs: &Self::EigVectors,
         vals: &Self::EigValues,
     );
+
+    fn std_norm_flow(
+        &mut self,
+        pos: &Self::Vector,
+        pos_out: &mut Self::Vector,
+        vel: &mut Self::Vector,
+        epsilon: f64,
+    );
+    fn std_norm_grad_flow(
+        &mut self,
+        pos: &Self::Vector,
+        grad: &Self::Vector,
+        vel: &Self::Vector,
+        vel_out: &mut Self::Vector,
+        epsilon: f64,
+    );
+    fn std_norm_grad_flow_inplace(
+        &mut self,
+        pos: &Self::Vector,
+        grad: &Self::Vector,
+        vel: &mut Self::Vector,
+        epsilon: f64,
+    );
+
+    /// Normalise `v` to unit length in-place: `v := v / ‖v‖`.
+    ///
+    /// If `‖v‖ < 1e-300` the vector is left unchanged.
+    fn array_normalize(&mut self, v: &mut Self::Vector);
+
+    /// Perform one ESH (Extended Stochastic Hamiltonian) momentum half-step.
+    ///
+    /// Updates `mom` in-place so that it remains on the unit sphere, and
+    /// returns the new cumulative kinetic-energy change `prev_delta_ke + ΔKE`.
+    ///
+    /// # Algorithm
+    ///
+    /// Given momentum `p` on the unit sphere, log-density gradient `g`,
+    /// half-step size `step`, and dimension `n`:
+    ///
+    /// ```text
+    /// ĝ      = g / ‖g‖
+    /// α      = p · ĝ
+    /// Δ      = step · ‖g‖ / (n − 1)
+    /// ζ      = exp(−Δ)
+    /// p_raw  = ĝ · (1 − ζ)(1 + ζ + α(1 − ζ))  +  2ζ p
+    /// p'     = p_raw / ‖p_raw‖
+    /// ΔKE    = (Δ − log 2 + log(1 + α + (1 − α)ζ²)) · (n − 1)
+    /// ```
+    ///
+    /// Reference: Steeg & Gallagher, arXiv:2111.02434 (2021), ported from the
+    /// [BlackJAX implementation](https://github.com/blackjax-devs/blackjax/blob/main/blackjax/mcmc/integrators.py#L314).
+    fn esh_momentum_update(
+        &mut self,
+        grad: &Self::Vector,
+        mom: &mut Self::Vector,
+        step: f64,
+    ) -> f64;
+
     fn array_vector_dot(&mut self, array1: &Self::Vector, array2: &Self::Vector) -> f64;
     fn array_gaussian<R: rand::Rng + ?Sized>(
         &mut self,
@@ -139,8 +233,8 @@ pub trait Math: HasDims {
     );
     fn array_update_var_inv_std_draw(
         &mut self,
-        variance_out: &mut Self::Vector,
         inv_std: &mut Self::Vector,
+        std: &mut Self::Vector,
         draw_var: &Self::Vector,
         scale: f64,
         fill_invalid: Option<f64>,
@@ -148,8 +242,8 @@ pub trait Math: HasDims {
     );
     fn array_update_var_inv_std_draw_grad(
         &mut self,
-        variance_out: &mut Self::Vector,
         inv_std: &mut Self::Vector,
+        std: &mut Self::Vector,
         draw_var: &Self::Vector,
         grad_var: &Self::Vector,
         fill_invalid: Option<f64>,
@@ -158,8 +252,8 @@ pub trait Math: HasDims {
 
     fn array_update_var_inv_std_grad(
         &mut self,
-        variance_out: &mut Self::Vector,
         inv_std: &mut Self::Vector,
+        std: &mut Self::Vector,
         gradient: &Self::Vector,
         fill_invalid: f64,
         clamp: (f64, f64),
@@ -202,6 +296,13 @@ pub trait Math: HasDims {
     ) -> Result<(), Self::LogpErr>;
 
     fn new_transformation<R: rand::Rng + ?Sized>(
+        &mut self,
+        rng: &mut R,
+        dim: usize,
+        chain: u64,
+    ) -> Result<Self::FlowParameters, Self::LogpErr>;
+
+    fn init_transformation<R: rand::Rng + ?Sized>(
         &mut self,
         rng: &mut R,
         untransformed_position: &Self::Vector,

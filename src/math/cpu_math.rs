@@ -1,26 +1,42 @@
+//! CPU backend that calls the user-supplied logp function and provides the required vector operations.
+
 use std::{collections::HashMap, error::Error, fmt::Debug, mem::replace};
 
-use faer::{Col, Mat};
+use faer::linalg::matmul::matmul;
+
+use faer::{Accum, Col, Mat, Par};
 use itertools::{Itertools, izip};
 use nuts_storable::{HasDims, Storable, Value};
 use rand::RngExt;
 use thiserror::Error;
 
-use crate::{
-    math::{axpy, axpy_out, multiply, scalar_prods2, scalar_prods3, vector_dot},
-    math_base::{LogpError, Math},
+use crate::math::util::multiply_inplace;
+
+use super::{
+    math::{LogpError, Math},
+    util::{
+        axpy, axpy_out, multiply, scalar_prods2, scalar_prods3, std_norm_flow, std_norm_grad_flow,
+        std_norm_grad_flow_inplace, vector_dot,
+    },
 };
 
 #[derive(Debug)]
 pub struct CpuMath<F: CpuLogpFunc> {
     logp_func: F,
     arch: pulp::Arch,
+    /// Preallocated scratch buffer for the low-rank transform intermediate vector
+    /// (U^T * rhs), sized to the current rank (vecs.ncols()). Resized as needed.
+    lowrank_scratch: Col<f64>,
 }
 
 impl<F: CpuLogpFunc> CpuMath<F> {
     pub fn new(logp_func: F) -> Self {
         let arch = pulp::Arch::new();
-        Self { logp_func, arch }
+        Self {
+            logp_func,
+            arch,
+            lowrank_scratch: Col::zeros(0),
+        }
     }
 }
 
@@ -281,6 +297,12 @@ impl<F: CpuLogpFunc> Math for CpuMath<F> {
         })
     }
 
+    fn array_sum_ln(&mut self, array: &Self::Vector) -> f64 {
+        let mut sum = 0f64;
+        faer::zip!(array).for_each(|faer::unzip!(val)| sum += val.ln());
+        sum
+    }
+
     fn array_mult(
         &mut self,
         array1: &Self::Vector,
@@ -293,6 +315,113 @@ impl<F: CpuLogpFunc> Math for CpuMath<F> {
             array2.try_as_col_major().unwrap().as_slice(),
             dest.try_as_col_major_mut().unwrap().as_slice_mut(),
         )
+    }
+
+    fn array_mult_inplace(&mut self, array1: &mut Self::Vector, array2: &Self::Vector) {
+        multiply_inplace(
+            self.arch,
+            array1.try_as_col_major_mut().unwrap().as_slice_mut(),
+            array2.try_as_col_major().unwrap().as_slice(),
+        )
+    }
+
+    fn array_recip(&mut self, array: &Self::Vector, dest: &mut Self::Vector) {
+        faer::zip!(array, dest).for_each(|faer::unzip!(val, dest)| *dest = val.recip())
+    }
+
+    fn apply_lowrank_transform(
+        &mut self,
+        vecs: &Self::EigVectors,
+        vals: &Self::EigValues,
+        rhs: &Self::Vector,
+        dest: &mut Self::Vector,
+    ) {
+        if vecs.ncols() == 0 {
+            self.copy_into(rhs, dest);
+            return;
+        }
+        // dest = (I + U * (diag(vals) - I) * U^T) * rhs
+        //      = rhs + U * (diag(vals) - I) * (U^T * rhs)
+
+        let rank = vecs.ncols();
+
+        // Resize scratch if needed (rank can change across calls)
+        if self.lowrank_scratch.nrows() != rank {
+            self.lowrank_scratch.resize_with(rank, |_| 0.0);
+        }
+
+        // scratch = U^T * rhs
+        matmul(
+            self.lowrank_scratch.as_mut(),
+            Accum::Replace,
+            vecs.transpose(),
+            rhs.as_ref(),
+            1.0,
+            Par::Seq,
+        );
+
+        // scratch = (diag(vals) - I) * scratch  (element-wise: scratch[i] *= vals[i] - 1)
+        self.lowrank_scratch
+            .iter_mut()
+            .zip(vals.iter())
+            .for_each(|(s, &v)| *s *= v - 1.0);
+
+        // dest = rhs + U * scratch
+        dest.copy_from(rhs);
+        matmul(
+            dest.as_mut(),
+            Accum::Add,
+            vecs.as_ref(),
+            self.lowrank_scratch.as_ref(),
+            1.0,
+            Par::Seq,
+        );
+    }
+
+    fn apply_lowrank_transform_inplace(
+        &mut self,
+        vecs: &Self::EigVectors,
+        vals: &Self::EigValues,
+        rhs_and_dest: &mut Self::Vector,
+    ) {
+        if vecs.ncols() == 0 {
+            return;
+        }
+        // rhs_and_dest = (I + U * (diag(vals) - I) * U^T) * rhs_and_dest
+        //              = rhs_and_dest + U * (diag(vals) - I) * (U^T * rhs_and_dest)
+
+        let rank = vecs.ncols();
+
+        // Resize scratch if needed
+        if self.lowrank_scratch.nrows() != rank {
+            self.lowrank_scratch.resize_with(rank, |_| 0.0);
+        }
+
+        // scratch = U^T * rhs_and_dest
+        matmul(
+            self.lowrank_scratch.as_mut(),
+            Accum::Replace,
+            vecs.transpose(),
+            rhs_and_dest.as_ref(),
+            1.0,
+            Par::Seq,
+        );
+
+        // scratch = (diag(vals) - I) * scratch  (element-wise: scratch[i] *= vals[i] - 1)
+        self.lowrank_scratch
+            .iter_mut()
+            .zip(vals.iter())
+            .for_each(|(s, &v)| *s *= v - 1.0);
+
+        // rhs_and_dest += U * scratch
+        matmul(
+            rhs_and_dest.as_mut(),
+            Accum::Add,
+            vecs.as_ref(),
+            self.lowrank_scratch.as_ref(),
+            1.0,
+            Par::Seq,
+        );
     }
 
     fn array_mult_eigs(
@@ -309,6 +438,116 @@ impl<F: CpuLogpFunc> Math for CpuMath<F> {
         let scaled = stds.as_diagonal() * inner_prod;
 
         let _ = replace(dest, scaled);
+    }
+
+    /// The exponential map of the Hamiltonian flow for the standard normal distribution.
+    ///
+    /// This is the harmonic oscillator with unit mass and unit frequency.
+    fn std_norm_flow(
+        &mut self,
+        pos: &Self::Vector,
+        pos_out: &mut Self::Vector,
+        vel: &mut Self::Vector,
+        epsilon: f64,
+    ) {
+        std_norm_flow(
+            self.arch,
+            pos.try_as_col_major().unwrap().as_slice(),
+            pos_out.try_as_col_major_mut().unwrap().as_slice_mut(),
+            vel.try_as_col_major_mut().unwrap().as_slice_mut(),
+            epsilon,
+        );
+    }
+
+    fn std_norm_grad_flow(
+        &mut self,
+        pos: &Self::Vector,
+        grad: &Self::Vector,
+        vel: &Self::Vector,
+        vel_out: &mut Self::Vector,
+        epsilon: f64,
+    ) {
+        std_norm_grad_flow(
+            self.arch,
+            pos.try_as_col_major().unwrap().as_slice(),
+            grad.try_as_col_major().unwrap().as_slice(),
+            vel.try_as_col_major().unwrap().as_slice(),
+            vel_out.try_as_col_major_mut().unwrap().as_slice_mut(),
+            epsilon,
+        );
+    }
+
+    fn std_norm_grad_flow_inplace(
+        &mut self,
+        pos: &Self::Vector,
+        grad: &Self::Vector,
+        vel: &mut Self::Vector,
+        epsilon: f64,
+    ) {
+        std_norm_grad_flow_inplace(
+            self.arch,
+            pos.try_as_col_major().unwrap().as_slice(),
+            grad.try_as_col_major().unwrap().as_slice(),
+            vel.try_as_col_major_mut().unwrap().as_slice_mut(),
+            epsilon,
+        );
+    }
+
+    fn array_normalize(&mut self, v: &mut Self::Vector) {
+        let v = v.try_as_col_major_mut().unwrap().as_slice_mut();
+        let norm: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let inv = 1.0 / norm;
+        for x in v.iter_mut() {
+            *x *= inv;
+        }
+    }
+
+    fn esh_momentum_update(
+        &mut self,
+        gradient: &Self::Vector,
+        momentum: &mut Self::Vector,
+        step_size: f64,
+    ) -> f64 {
+        let gradient = gradient.try_as_col_major().unwrap().as_slice();
+        let momentum = momentum.try_as_col_major_mut().unwrap().as_slice_mut();
+        let n = gradient.len();
+        assert!(n >= 2, "ESH dynamics requires at least 2 dimensions");
+
+        // ‖g‖
+        let grad_norm: f64 = gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
+
+        let inv_grad_norm = 1.0 / grad_norm;
+
+        // α = p · ĝ
+        let momentum_proj: f64 = momentum
+            .iter()
+            .zip(gradient.iter())
+            .map(|(p, g)| p * g * inv_grad_norm)
+            .sum();
+
+        let dims_m1 = (n - 1) as f64;
+        let delta = step_size * grad_norm / dims_m1;
+        let zeta = (-delta).exp();
+
+        // p_raw = ĝ · (1 − ζ)(1 + ζ + α(1 − ζ))  +  2ζ p
+        let coeff_g = (1.0 - zeta) * (1.0 + zeta + momentum_proj * (1.0 - zeta));
+        let coeff_p = 2.0 * zeta;
+
+        for (p, g) in momentum.iter_mut().zip(gradient.iter()) {
+            *p = coeff_g * (g * inv_grad_norm) + coeff_p * *p;
+        }
+
+        // Renormalise to unit sphere.
+        let raw_norm: f64 = momentum.iter().map(|p| p * p).sum::<f64>().sqrt();
+        let inv = 1.0 / raw_norm;
+        for p in momentum.iter_mut() {
+            *p *= inv;
+        }
+
+        let arg = momentum_proj + (1.0 - momentum_proj) * zeta * zeta;
+        let kinetic_energy_change = (delta - std::f64::consts::LN_2 + arg.ln_1p()) * dims_m1;
+
+        kinetic_energy_change
     }
 
     fn array_vector_dot(&mut self, array1: &Self::Vector, array2: &Self::Vector) -> f64 {
@@ -393,8 +632,8 @@ impl<F: CpuLogpFunc> Math for CpuMath<F> {
 
     fn array_update_var_inv_std_draw(
         &mut self,
-        variance_out: &mut Self::Vector,
         inv_std: &mut Self::Vector,
+        std: &mut Self::Vector,
         draw_var: &Self::Vector,
         scale: f64,
         fill_invalid: Option<f64>,
@@ -402,8 +641,7 @@ impl<F: CpuLogpFunc> Math for CpuMath<F> {
     ) {
         self.arch.dispatch(|| {
             izip!(
-                variance_out
-                    .try_as_col_major_mut()
+                std.try_as_col_major_mut()
                     .unwrap()
                     .as_slice_mut()
                     .iter_mut(),
@@ -414,16 +652,16 @@ impl<F: CpuLogpFunc> Math for CpuMath<F> {
                     .iter_mut(),
                 draw_var.try_as_col_major().unwrap().as_slice().iter(),
             )
-            .for_each(|(var_out, inv_std_out, &draw_var)| {
+            .for_each(|(std_out, inv_std_out, &draw_var)| {
                 let draw_var = draw_var * scale;
                 if (!draw_var.is_finite()) | (draw_var == 0f64) {
                     if let Some(fill_val) = fill_invalid {
-                        *var_out = fill_val;
+                        *std_out = fill_val.sqrt();
                         *inv_std_out = fill_val.recip().sqrt();
                     }
                 } else {
                     let val = draw_var.clamp(clamp.0, clamp.1);
-                    *var_out = val;
+                    *std_out = val.sqrt();
                     *inv_std_out = val.recip().sqrt();
                 }
             });
@@ -432,8 +670,8 @@ impl<F: CpuLogpFunc> Math for CpuMath<F> {
 
     fn array_update_var_inv_std_draw_grad(
         &mut self,
-        variance_out: &mut Self::Vector,
         inv_std: &mut Self::Vector,
+        std: &mut Self::Vector,
         draw_var: &Self::Vector,
         grad_var: &Self::Vector,
         fill_invalid: Option<f64>,
@@ -441,8 +679,7 @@ impl<F: CpuLogpFunc> Math for CpuMath<F> {
     ) {
         self.arch.dispatch(|| {
             izip!(
-                variance_out
-                    .try_as_col_major_mut()
+                std.try_as_col_major_mut()
                     .unwrap()
                     .as_slice_mut()
                     .iter_mut(),
@@ -454,16 +691,16 @@ impl<F: CpuLogpFunc> Math for CpuMath<F> {
                 draw_var.try_as_col_major().unwrap().as_slice().iter(),
                 grad_var.try_as_col_major().unwrap().as_slice().iter(),
             )
-            .for_each(|(var_out, inv_std_out, &draw_var, &grad_var)| {
+            .for_each(|(std_out, inv_std_out, &draw_var, &grad_var)| {
                 let val = (draw_var / grad_var).sqrt();
                 if (!val.is_finite()) | (val == 0f64) {
                     if let Some(fill_val) = fill_invalid {
-                        *var_out = fill_val;
+                        *std_out = fill_val.sqrt();
                         *inv_std_out = fill_val.recip().sqrt();
                     }
                 } else {
                     let val = val.clamp(clamp.0, clamp.1);
-                    *var_out = val;
+                    *std_out = val.sqrt();
                     *inv_std_out = val.recip().sqrt();
                 }
             });
@@ -472,16 +709,15 @@ impl<F: CpuLogpFunc> Math for CpuMath<F> {
 
     fn array_update_var_inv_std_grad(
         &mut self,
-        variance_out: &mut Self::Vector,
         inv_std: &mut Self::Vector,
+        std: &mut Self::Vector,
         gradient: &Self::Vector,
         fill_invalid: f64,
         clamp: (f64, f64),
     ) {
         self.arch.dispatch(|| {
             izip!(
-                variance_out
-                    .try_as_col_major_mut()
+                std.try_as_col_major_mut()
                     .unwrap()
                     .as_slice_mut()
                     .iter_mut(),
@@ -492,10 +728,10 @@ impl<F: CpuLogpFunc> Math for CpuMath<F> {
                     .iter_mut(),
                 gradient.try_as_col_major().unwrap().as_slice().iter(),
             )
-            .for_each(|(var_out, inv_std_out, &grad_var)| {
+            .for_each(|(std_out, inv_std_out, &grad_var)| {
                 let val = grad_var.abs().clamp(clamp.0, clamp.1).recip();
                 let val = if val.is_finite() { val } else { fill_invalid };
-                *var_out = val;
+                *std_out = val.sqrt();
                 *inv_std_out = val.recip().sqrt();
             });
         });
@@ -611,14 +847,14 @@ impl<F: CpuLogpFunc> Math for CpuMath<F> {
         )
     }
 
-    fn new_transformation<R: rand::Rng + ?Sized>(
+    fn init_transformation<R: rand::Rng + ?Sized>(
         &mut self,
         rng: &mut R,
         untransformed_position: &Self::Vector,
         untransfogmed_gradient: &Self::Vector,
         chain: u64,
     ) -> Result<Self::FlowParameters, Self::LogpErr> {
-        self.logp_func.new_transformation(
+        self.logp_func.init_transformation(
             rng,
             untransformed_position
                 .try_as_col_major()
@@ -630,6 +866,15 @@ impl<F: CpuLogpFunc> Math for CpuMath<F> {
                 .as_slice(),
             chain,
         )
+    }
+
+    fn new_transformation<R: rand::Rng + ?Sized>(
+        &mut self,
+        rng: &mut R,
+        dim: usize,
+        chain: u64,
+    ) -> Result<Self::FlowParameters, Self::LogpErr> {
+        self.logp_func.new_transformation(rng, dim, chain)
     }
 
     fn transformation_id(&self, params: &Self::FlowParameters) -> Result<i64, Self::LogpErr> {
@@ -700,11 +945,20 @@ pub trait CpuLogpFunc: HasDims {
         unimplemented!()
     }
 
-    fn new_transformation<R: rand::Rng + ?Sized>(
+    fn init_transformation<R: rand::Rng + ?Sized>(
         &mut self,
         _rng: &mut R,
         _untransformed_position: &[f64],
         _untransformed_gradient: &[f64],
+        _chain: u64,
+    ) -> Result<Self::FlowParameters, Self::LogpError> {
+        unimplemented!()
+    }
+
+    fn new_transformation<R: rand::Rng + ?Sized>(
+        &mut self,
+        _rng: &mut R,
+        _dim: usize,
         _chain: u64,
     ) -> Result<Self::FlowParameters, Self::LogpError> {
         unimplemented!()
@@ -720,6 +974,7 @@ impl<M: CpuLogpFunc + Clone> Clone for CpuMath<M> {
         Self {
             logp_func: self.logp_func.clone(),
             arch: self.arch,
+            lowrank_scratch: Col::zeros(self.lowrank_scratch.nrows()),
         }
     }
 }

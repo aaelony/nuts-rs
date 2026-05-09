@@ -1,8 +1,4 @@
-//! CSV storage backend for nuts-rs that outputs CmdStan-compatible CSV files
-//!
-//! This module provides a CSV storage backend that saves MCMC samples and
-//! statistics in a format compatible with CmdStan, allowing existing Stan
-//! analysis tools and libraries to read nuts-rs results.
+//! Store samples and statistics as CmdStan-compatible CSV files.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -625,9 +621,7 @@ impl TraceStorage for CsvTraceStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        CpuLogpFunc, CpuMath, CpuMathError, DiagGradNutsSettings, LogpError, Model, Sampler,
-    };
+    use crate::{CpuLogpFunc, CpuMath, CpuMathError, DiagNutsSettings, LogpError, Model, Sampler};
     use anyhow::Result;
     use nuts_derive::Storable;
     use nuts_storable::{HasDims, Value};
@@ -841,7 +835,7 @@ mod tests {
             math: CpuMath::new(MultiDimTestLogp { dim_a: 2, dim_b: 2 }),
         };
 
-        let mut settings = DiagGradNutsSettings::default();
+        let mut settings = DiagNutsSettings::default();
         settings.num_chains = 1;
         settings.num_tune = 10;
         settings.num_draws = 20;
@@ -907,7 +901,7 @@ mod tests {
             math: CpuMath::new(SimpleTestLogp { dim: 3 }),
         };
 
-        let mut settings = DiagGradNutsSettings::default();
+        let mut settings = DiagNutsSettings::default();
         settings.num_chains = 1;
         settings.num_tune = 5;
         settings.num_draws = 10;

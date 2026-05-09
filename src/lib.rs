@@ -9,7 +9,7 @@
 //! ## Usage
 //!
 //! ```
-//! use nuts_rs::{CpuLogpFunc, CpuMath, LogpError, DiagGradNutsSettings, Chain, Progress,
+//! use nuts_rs::{CpuLogpFunc, CpuMath, LogpError, DiagNutsSettings, Chain, Progress,
 //! Settings, HasDims};
 //! use thiserror::Error;
 //! use rand::rng;
@@ -65,7 +65,7 @@
 //! }
 //!
 //! // We get the default sampler arguments
-//! let mut settings = DiagGradNutsSettings::default();
+//! let mut settings = DiagNutsSettings::default();
 //!
 //! // and modify as we like
 //! settings.num_tune = 1000;
@@ -100,21 +100,17 @@
 
 mod adapt_strategy;
 mod chain;
-mod cpu_math;
-mod euclidean_hamiltonian;
-mod hamiltonian;
-mod mass_matrix;
+mod dynamics;
+mod external_adapt_strategy;
 mod math;
-mod math_base;
+mod mclmc;
 mod model;
 mod nuts;
 mod sampler;
 mod sampler_stats;
-mod state;
 mod stepsize;
 mod storage;
-mod transform_adapt_strategy;
-mod transformed_hamiltonian;
+mod transform;
 
 pub use nuts_derive::Storable;
 pub use nuts_storable::{DateTimeUnit, HasDims, ItemType, Storable, Value};
@@ -122,22 +118,28 @@ pub use rand;
 
 pub use adapt_strategy::EuclideanAdaptOptions;
 pub use chain::Chain;
-pub use cpu_math::{CpuLogpFunc, CpuMath, CpuMathError};
-pub use hamiltonian::DivergenceInfo;
-pub use math_base::{LogpError, Math};
+pub use dynamics::{DivergenceInfo, KineticEnergyKind};
+pub use math::{CpuLogpFunc, CpuMath, CpuMathError, LogpError, Math};
+pub use mclmc::{MclmcChain, MclmcInfo, MclmcStats, MclmcTrajectoryKind};
 pub use model::Model;
 pub use nuts::NutsError;
+
+#[allow(deprecated)]
 pub use sampler::{
-    ChainProgress, DiagGradNutsSettings, LowRankNutsSettings, NutsSettings, Progress,
-    ProgressCallback, Sampler, SamplerWaitResult, Settings, TransformedNutsSettings,
-    sample_sequentially,
+    ChainProgress, DiagGradNutsSettings, DiagMclmcSettings, DiagNutsSettings, FlowMclmcSettings,
+    FlowNutsSettings, LowRankMclmcSettings, LowRankNutsSettings, MclmcSettings, NutsSettings,
+    Progress, Settings, TransformedMclmcSettings,
+    TransformedNutsSettings, sample_sequentially,
 };
+#[cfg(feature = "parallel")]
+pub use sampler::{ProgressCallback, Sampler, SamplerWaitResult};
 pub use sampler_stats::SamplerStats;
 
-pub use mass_matrix::DiagAdaptExpSettings;
-pub use mass_matrix::LowRankSettings;
+#[allow(deprecated)]
+pub use external_adapt_strategy::{FlowSettings, TransformedSettings};
 pub use stepsize::{AdamOptions, StepSizeAdaptMethod, StepSizeAdaptOptions, StepSizeSettings};
-pub use transform_adapt_strategy::TransformedSettings;
+pub use transform::DiagAdaptExpSettings;
+pub use transform::LowRankSettings;
 
 #[cfg(feature = "zarr")]
 pub use storage::{ZarrAsyncConfig, ZarrAsyncTraceStorage, ZarrConfig, ZarrTraceStorage};
